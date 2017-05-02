@@ -1,0 +1,317 @@
+Index: nginx-1.12.0/src/core/ngx_connection.c
+===================================================================
+--- nginx-1.12.0.orig/src/core/ngx_connection.c	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/core/ngx_connection.c	2017-04-15 04:39:29.885545744 +0300
+@@ -1402,3 +1402,60 @@
+ 
+     return NGX_ERROR;
+ }
++
++
++/*
++ * When a socket is idle, determines if the kernel is draining its buffer
++ * faster than minimum_rate. Avoids false negatives by allowing sufficient
++ * time to pass (currently 1 second) before recording the current send rate.
++ * Used to avoid closing an active connection whose buffers are so large
++ * relative to throughput that we stop sending data for long periods of time.
++ */
++ngx_flag_t
++ngx_connection_sending_above_rate(
++    ngx_connection_t *c, size_t minimum_rate)
++{
++    ssize_t     new_unacknowledged_bytes, bytes_sent;
++    ngx_msec_t  t1, time_elapsed;
++    ngx_time_t *tp;
++
++    if (minimum_rate == 0) {
++        return 0;
++    }
++
++    tp = ngx_timeofday();
++    t1 = (ngx_msec_t) (tp->sec * 1000 + tp->msec);
++    time_elapsed = t1 - c->last_send_rate_time;
++
++    if (time_elapsed < 1000) {
++        /*
++         * Need more time to get an accurate rate.
++         * Defends against spurious wakeups when used in the timeout handler
++         */
++        return 1;
++    }
++
++    new_unacknowledged_bytes = ngx_tcp_unacknowledged_bytes(c->fd);
++    bytes_sent = c->socket_unacknowledged_bytes - new_unacknowledged_bytes;
++
++    c->socket_unacknowledged_bytes = new_unacknowledged_bytes;
++    c->last_send_rate_time = t1;
++
++    if (bytes_sent < 0) {
++        /* buffer grew */
++        return 1;
++    }
++
++    if ((size_t)bytes_sent >= (time_elapsed * minimum_rate) / 1000) {
++        return 1;
++    }
++
++    return 0;
++}
++
++
++void
++ngx_connection_reset_send_rate(ngx_connection_t *c)
++{
++    c->socket_unacknowledged_bytes = 0;
++}
+Index: nginx-1.12.0/src/core/ngx_connection.h
+===================================================================
+--- nginx-1.12.0.orig/src/core/ngx_connection.h	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/core/ngx_connection.h	2017-04-15 04:39:29.885545744 +0300
+@@ -189,6 +189,9 @@
+ #if (NGX_THREADS || NGX_COMPAT)
+     ngx_thread_task_t  *sendfile_task;
+ #endif
++
++    ssize_t             socket_unacknowledged_bytes;
++    ngx_msec_t          last_send_rate_time;
+ };
+ 
+ 
+@@ -221,4 +224,8 @@
+ 
+ void ngx_reusable_connection(ngx_connection_t *c, ngx_uint_t reusable);
+ 
++ngx_flag_t ngx_connection_sending_above_rate(ngx_connection_t *c,
++    size_t minimum_rate);
++void ngx_connection_reset_send_rate(ngx_connection_t *c);
++
+ #endif /* _NGX_CONNECTION_H_INCLUDED_ */
+Index: nginx-1.12.0/src/http/ngx_http_core_module.c
+===================================================================
+--- nginx-1.12.0.orig/src/http/ngx_http_core_module.c	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/http/ngx_http_core_module.c	2017-04-15 04:39:29.886545721 +0300
+@@ -763,6 +763,13 @@
+ 
+ #endif
+ 
++    { ngx_string("send_minimum_rate"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_size_slot,
++      NGX_HTTP_LOC_CONF_OFFSET,
++      offsetof(ngx_http_core_loc_conf_t, send_minimum_rate),
++      NULL },
++
+       ngx_null_command
+ };
+ 
+@@ -3581,6 +3588,7 @@
+     clcf->tcp_nopush = NGX_CONF_UNSET;
+     clcf->tcp_nodelay = NGX_CONF_UNSET;
+     clcf->send_timeout = NGX_CONF_UNSET_MSEC;
++    clcf->send_minimum_rate = NGX_CONF_UNSET_SIZE;
+     clcf->send_lowat = NGX_CONF_UNSET_SIZE;
+     clcf->postpone_output = NGX_CONF_UNSET_SIZE;
+     clcf->limit_rate = NGX_CONF_UNSET_SIZE;
+@@ -3807,6 +3815,8 @@
+     ngx_conf_merge_value(conf->tcp_nodelay, prev->tcp_nodelay, 1);
+ 
+     ngx_conf_merge_msec_value(conf->send_timeout, prev->send_timeout, 60000);
++    ngx_conf_merge_size_value(conf->send_minimum_rate, prev->send_minimum_rate,
++                              0);
+     ngx_conf_merge_size_value(conf->send_lowat, prev->send_lowat, 0);
+     ngx_conf_merge_size_value(conf->postpone_output, prev->postpone_output,
+                               1460);
+Index: nginx-1.12.0/src/http/ngx_http_core_module.h
+===================================================================
+--- nginx-1.12.0.orig/src/http/ngx_http_core_module.h	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/http/ngx_http_core_module.h	2017-04-15 04:39:29.887545698 +0300
+@@ -362,6 +362,7 @@
+     size_t        limit_rate_after;        /* limit_rate_after */
+     size_t        sendfile_max_chunk;      /* sendfile_max_chunk */
+     size_t        read_ahead;              /* read_ahead */
++    size_t        send_minimum_rate;       /* send_minimum_rate */
+ 
+     ngx_msec_t    client_body_timeout;     /* client_body_timeout */
+     ngx_msec_t    send_timeout;            /* send_timeout */
+Index: nginx-1.12.0/src/http/ngx_http_request.c
+===================================================================
+--- nginx-1.12.0.orig/src/http/ngx_http_request.c	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/http/ngx_http_request.c	2017-04-15 04:39:29.887545698 +0300
+@@ -2626,6 +2626,13 @@
+     clcf = ngx_http_get_module_loc_conf(r->main, ngx_http_core_module);
+ 
+     if (wev->timedout) {
++        if (ngx_connection_sending_above_rate(c, clcf->send_minimum_rate)) {
++            wev->timedout = 0;
++            if (!wev->delayed) {
++                ngx_add_timer(wev, clcf->send_timeout);
++            }
++            return;
++        }
+         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                       "client timed out");
+         c->timedout = 1;
+@@ -2634,6 +2641,8 @@
+         return;
+     }
+ 
++    ngx_connection_reset_send_rate(c);
++
+     if (wev->delayed || r->aio) {
+         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, wev->log, 0,
+                        "http writer delayed");
+Index: nginx-1.12.0/src/http/ngx_http_upstream.c
+===================================================================
+--- nginx-1.12.0.orig/src/http/ngx_http_upstream.c	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/http/ngx_http_upstream.c	2017-04-15 04:39:29.889545652 +0300
+@@ -3295,13 +3295,22 @@
+     downstream = c;
+     upstream = u->peer.connection;
+ 
++    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++
+     if (downstream->write->timedout) {
+-        c->timedout = 1;
+-        ngx_connection_error(c, NGX_ETIMEDOUT, "client timed out");
+-        ngx_http_upstream_finalize_request(r, u, NGX_HTTP_REQUEST_TIME_OUT);
+-        return;
++        if (ngx_connection_sending_above_rate(c, clcf->send_minimum_rate)) {
++            downstream->write->timedout = 0;
++
++        } else {
++            c->timedout = 1;
++            ngx_connection_error(c, NGX_ETIMEDOUT, "client timed out");
++            ngx_http_upstream_finalize_request(r, u, NGX_HTTP_REQUEST_TIME_OUT);
++            return;
++        }
+     }
+ 
++    ngx_connection_reset_send_rate(c);
++
+     if (upstream->read->timedout || upstream->write->timedout) {
+         ngx_connection_error(c, NGX_ETIMEDOUT, "upstream timed out");
+         ngx_http_upstream_finalize_request(r, u, NGX_HTTP_GATEWAY_TIME_OUT);
+@@ -3404,8 +3413,6 @@
+         return;
+     }
+ 
+-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+-
+     if (ngx_handle_write_event(upstream->write, u->conf->send_lowat)
+         != NGX_OK)
+     {
+@@ -3459,6 +3466,7 @@
+     ngx_event_t          *wev;
+     ngx_connection_t     *c;
+     ngx_http_upstream_t  *u;
++    ngx_http_core_loc_conf_t  *clcf;
+ 
+     c = r->connection;
+     u = r->upstream;
+@@ -3470,12 +3478,21 @@
+     c->log->action = "sending to client";
+ 
+     if (wev->timedout) {
+-        c->timedout = 1;
+-        ngx_connection_error(c, NGX_ETIMEDOUT, "client timed out");
+-        ngx_http_upstream_finalize_request(r, u, NGX_HTTP_REQUEST_TIME_OUT);
+-        return;
++        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++
++        if (ngx_connection_sending_above_rate(c, clcf->send_minimum_rate)) {
++            wev->timedout = 0;
++
++        } else {
++            c->timedout = 1;
++            ngx_connection_error(c, NGX_ETIMEDOUT, "client timed out");
++            ngx_http_upstream_finalize_request(r, u, NGX_HTTP_REQUEST_TIME_OUT);
++            return;
++        }
+     }
+ 
++    ngx_connection_reset_send_rate(c);
++
+     ngx_http_upstream_process_non_buffered_request(r, 1);
+ }
+ 
+@@ -3785,6 +3802,7 @@
+     ngx_connection_t     *c;
+     ngx_event_pipe_t     *p;
+     ngx_http_upstream_t  *u;
++    ngx_http_core_loc_conf_t  *clcf;
+ 
+     c = r->connection;
+     u = r->upstream;
+@@ -3801,7 +3819,18 @@
+ #endif
+ 
+     if (wev->timedout) {
++        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++
++        if (ngx_connection_sending_above_rate(c, clcf->send_minimum_rate)) {
++            wev->timedout = 0;
++            ngx_add_timer(wev, p->send_timeout);
+ 
++            if (ngx_handle_write_event(wev, p->send_lowat) != NGX_OK) {
++                ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
++            }
++
++            return;
++        }
+         p->downstream_error = 1;
+         c->timedout = 1;
+         ngx_connection_error(c, NGX_ETIMEDOUT, "client timed out");
+@@ -3826,6 +3855,8 @@
+         }
+     }
+ 
++    ngx_connection_reset_send_rate(c);
++
+     ngx_http_upstream_process_request(r, u);
+ }
+ 
+Index: nginx-1.12.0/src/os/unix/ngx_socket.c
+===================================================================
+--- nginx-1.12.0.orig/src/os/unix/ngx_socket.c	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/os/unix/ngx_socket.c	2017-04-15 04:39:29.889545652 +0300
+@@ -114,3 +114,28 @@
+ }
+ 
+ #endif
++
++
++#if (NGX_LINUX)
++
++int
++ngx_tcp_unacknowledged_bytes(ngx_socket_t s)
++{
++    int  bs;
++
++    if (ioctl(s, TIOCOUTQ, &bs) == -1) {
++        return 0;
++    }
++
++    return bs;
++}
++
++#else
++
++int
++ngx_tcp_unacknowledged_bytes(ngx_socket_t s)
++{
++    return 0;
++}
++
++#endif
+Index: nginx-1.12.0/src/os/unix/ngx_socket.h
+===================================================================
+--- nginx-1.12.0.orig/src/os/unix/ngx_socket.h	2017-04-15 04:39:30.043542084 +0300
++++ nginx-1.12.0/src/os/unix/ngx_socket.h	2017-04-15 04:39:29.889545652 +0300
+@@ -40,6 +40,7 @@
+ 
+ int ngx_tcp_nopush(ngx_socket_t s);
+ int ngx_tcp_push(ngx_socket_t s);
++int ngx_tcp_unacknowledged_bytes(ngx_socket_t s);
+ 
+ #if (NGX_LINUX)
+ 
